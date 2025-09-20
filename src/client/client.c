@@ -121,6 +121,12 @@ void app_init() {
           "Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8
           " %02" PRIx8 " %02" PRIx8 "\n",
           port_id, RTE_ETHER_ADDR_BYTES(&eth_addr));
+
+  ret = rte_eth_promiscuous_enable(port_id);
+  if (ret < 0) {
+    rte_exit(EXIT_FAILURE, "Cannot enable promiscuous mode: err=%d, port=%u\n",
+             ret, port_id);
+  }
 }
 
 int app_parse_args(int argc, char **argv) {
