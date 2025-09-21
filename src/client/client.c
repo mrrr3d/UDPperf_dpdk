@@ -1,5 +1,8 @@
+#include <generic/rte_cycles.h>
+#include <rte_branch_prediction.h>
 #include <rte_build_config.h>
 #include <rte_common.h>
+#include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
@@ -126,6 +129,60 @@ void app_init() {
   if (ret < 0) {
     rte_exit(EXIT_FAILURE, "Cannot enable promiscuous mode: err=%d, port=%u\n",
              ret, port_id);
+  }
+}
+
+void lcore_main() {
+  uint32_t lcore_id = rte_lcore_id();
+  fprintf(stdout, "lcore %u started\n", lcore_id);
+
+  uint64_t now_tsc = rte_rdtsc();
+  uint64_t tsc_hz = rte_get_tsc_hz();
+  uint64_t next_update_tsc = now_tsc + tsc_hz;
+
+  uint64_t tsc_ms = tsc_hz / MS_PER_S;
+  uint64_t next_ms_tsc = now_tsc + tsc_ms;
+
+  uint64_t drain_tsc = (tsc_hz + US_PER_S - 1) / US_PER_S * 10;
+  uint64_t next_drain_tsc = now_tsc + drain_tsc;
+
+  uint64_t finish_tsc = now_tsc + time_to_run * tsc_hz;
+
+  uint64_t pkts_send_ms_cnt = 0;
+
+  while (1) {
+    now_tsc = rte_rdtsc();
+
+    // finished
+    if (unlikely(now_tsc > finish_tsc)) {
+      fprintf(stdout, "Finished\n");
+      break;
+    }
+
+    if (unlikely(now_tsc > next_update_tsc)) {
+      if (lcore_id == rte_get_main_lcore()) {
+        // TODO: print throughput here
+      }
+      next_update_tsc += tsc_hz;
+    }
+
+    if (unlikely(now_tsc > next_ms_tsc)) {
+      pkts_send_ms_cnt = 0;
+      next_ms_tsc += tsc_ms;
+    }
+
+    if (unlikely(now_tsc > next_drain_tsc)) {
+      // TODO: send packets
+      next_drain_tsc += drain_tsc;
+    }
+
+    if ((now_tsc <= finish_tsc) &&
+        (pkts_send_ms_cnt < pkts_send_limit_per_ms)) {
+      pkts_send_ms_cnt++;
+      // TODO: allocate buffer
+      // TODO: generate packet
+      // TODO: enqueue packet
+    }
   }
 }
 
