@@ -1,18 +1,24 @@
+#include <arpa/inet.h>
+#include <assert.h>
 #include <generic/rte_cycles.h>
 #include <rte_branch_prediction.h>
 #include <rte_build_config.h>
+#include <rte_byteorder.h>
 #include <rte_common.h>
 #include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
+#include <rte_ip4.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mbuf_core.h>
+#include <rte_udp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -21,11 +27,86 @@
 #define TX_RING_SIZE 1024
 #define RX_RING_SIZE 1024
 #define RX_QUEUES_PER_PORT 2
+#define MAX_BURST_SIZE 32
 
+struct mbuf_table {
+  uint32_t len;
+  struct rte_mbuf *m_table[MAX_BURST_SIZE];
+};
+
+struct lcore_configuration {
+  uint32_t vid;
+  uint32_t port;
+  uint32_t tx_queue_id;
+  struct mbuf_table tx_mbufs;
+} __rte_cache_aligned;
+
+struct throughput_statistics {
+  uint64_t tx_bits;
+  uint64_t last_tx_bits;
+  uint64_t dropped_pkts;
+  uint64_t last_dropped_pkts;
+} __rte_cache_aligned;
+
+struct MessageHeader {
+  uint32_t seq_num;
+  uint32_t rank;
+
+  uint8_t fill_pkt[1450];
+} __rte_packed;
+
+struct lcore_configuration lcore_conf[RTE_MAX_LCORE];
+struct throughput_statistics tput_stat[RTE_MAX_LCORE];
+uint8_t header_template[sizeof(struct rte_ether_hdr) +
+                        sizeof(struct rte_ipv4_hdr) +
+                        sizeof(struct rte_udp_hdr)];
 uint64_t pkts_send_limit_per_ms = 800;
 uint64_t time_to_run = 10;
 
+uint32_t n_lcores;
+
 struct rte_mempool *pktmbuf_pool;
+
+void init_header_template() {
+  memset(header_template, 0, sizeof(header_template));
+
+  struct rte_ether_hdr *eth_hdr = (struct rte_ether_hdr *)header_template;
+  struct rte_ipv4_hdr *ipv4_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+  struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)(ipv4_hdr + 1);
+
+  uint32_t pkt_len = sizeof(header_template) + sizeof(struct MessageHeader);
+
+  // ethernet header
+  eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+  struct rte_ether_addr src_addr = {
+      .addr_bytes = {0x00, 0x01, 0x02, 0x00, 0x00, 0x01}};
+  struct rte_ether_addr dst_addr = {
+      .addr_bytes = {0x00, 0x01, 0x02, 0x00, 0x00, 0x02}};
+  rte_ether_addr_copy(&src_addr, &eth_hdr->src_addr);
+  rte_ether_addr_copy(&dst_addr, &eth_hdr->dst_addr);
+
+  // ip header
+  ipv4_hdr->src_addr = htonl(0x01010101);
+  ipv4_hdr->dst_addr = htonl(0x02020202);
+  ipv4_hdr->total_length =
+      rte_cpu_to_be_16(pkt_len - sizeof(struct rte_ether_hdr));
+  ipv4_hdr->version_ihl = 0x45;
+  ipv4_hdr->type_of_service = 0;
+  ipv4_hdr->packet_id = 0;
+  ipv4_hdr->fragment_offset = 0;
+  ipv4_hdr->time_to_live = 64;
+  ipv4_hdr->next_proto_id = IPPROTO_UDP;
+
+  uint16_t ipv4_checksum = rte_ipv4_cksum(ipv4_hdr);
+  ipv4_hdr->hdr_checksum = ipv4_checksum;
+
+  // udp header
+  udp_hdr->src_port = htons(8000);
+  udp_hdr->dst_port = htons(8000);
+  udp_hdr->dgram_len = rte_cpu_to_be_16(pkt_len - sizeof(struct rte_ether_hdr) -
+                                        sizeof(struct rte_ipv4_hdr));
+  udp_hdr->dgram_cksum = 0;
+}
 
 void app_init() {
   fprintf(stdout, "App init\n");
@@ -42,7 +123,7 @@ void app_init() {
   }
   fprintf(stdout, "Mbuf pool created\n");
 
-  uint32_t n_lcores = rte_lcore_count();
+  n_lcores = rte_lcore_count();
   fprintf(stdout, "Number of lcores: %d\n", n_lcores);
 
   // TODO: currently only use 1 port
@@ -50,6 +131,17 @@ void app_init() {
 
   // Initialize port
   uint32_t port_id = 0;
+
+  uint32_t vid = 0;
+  uint32_t tx_queue_id = 0;
+  for (int i = 0; i < RTE_MAX_LCORE; i++) {
+    if (rte_lcore_is_enabled(i)) {
+      lcore_conf[i].vid = vid++;
+      lcore_conf[i].port = port_id;
+      lcore_conf[i].tx_queue_id = tx_queue_id++;
+      lcore_conf[i].tx_mbufs.len = 0;
+    }
+  }
 
   if (!rte_eth_dev_is_valid_port(port_id)) {
     fprintf(stderr, "Invalid port %d\n", port_id);
@@ -130,6 +222,92 @@ void app_init() {
     rte_exit(EXIT_FAILURE, "Cannot enable promiscuous mode: err=%d, port=%u\n",
              ret, port_id);
   }
+  init_header_template();
+}
+
+void send_pcakets(uint32_t lcore_id) {
+  struct lcore_configuration *conf = &lcore_conf[lcore_id];
+
+  uint32_t len = conf->tx_mbufs.len;
+  struct rte_mbuf **m_table = (struct rte_mbuf **)conf->tx_mbufs.m_table;
+
+  int ret;
+
+  ret = rte_eth_tx_burst(conf->port, conf->tx_queue_id, m_table, len);
+  // TODO: here should use bits
+  tput_stat[conf->vid].tx_bits += ret * 8;
+  if (unlikely(ret < len)) {
+    tput_stat[conf->vid].dropped_pkts += len - ret;
+    do {
+      rte_pktmbuf_free(m_table[ret]);
+    } while (++ret < len);
+  }
+  conf->tx_mbufs.len = 0;
+}
+
+void print_per_core_throughput(uint32_t seconds) {
+  fprintf(stdout, "%6" PRIu32 " seconds\n", seconds);
+
+  uint64_t total_tx_bits = 0;
+  uint64_t total_dropped_pkts = 0;
+
+  for (int i = 0; i < n_lcores; i++) {
+    struct throughput_statistics *stat = &tput_stat[i];
+    uint64_t tx_bits = stat->tx_bits - stat->last_tx_bits;
+    uint64_t dropped_pkts = stat->dropped_pkts - stat->last_dropped_pkts;
+    fprintf(stdout,
+            "\tcore %" PRIu32 "\ttx_bits: %" PRIu64 "\tdropped_pkts: %" PRIu64
+            "\n",
+            i, tx_bits, dropped_pkts);
+
+    stat->last_tx_bits = stat->tx_bits;
+    stat->last_dropped_pkts = stat->dropped_pkts;
+
+    total_tx_bits += tx_bits;
+    total_dropped_pkts += dropped_pkts;
+  }
+
+  fprintf(stdout, "\ttotal\ttx_bits: %" PRIu64 "\tdropped_pkts: %" PRIu64 "\n",
+          total_tx_bits, total_dropped_pkts);
+
+  fflush(stdout);
+}
+
+void enqueue_packet(uint32_t lcore_id, struct rte_mbuf *pkt) {
+  struct lcore_configuration *conf = &lcore_conf[lcore_id];
+  conf->tx_mbufs.m_table[conf->tx_mbufs.len++] = pkt;
+
+  if (unlikely(conf->tx_mbufs.len == MAX_BURST_SIZE)) {
+    send_pcakets(lcore_id);
+  }
+}
+
+void generate_packet(struct rte_mbuf *mbuf) {
+  assert(mbuf != NULL);
+
+  struct rte_ether_hdr *eth_hdr =
+      rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+  struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+  struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)(ip_hdr + 1);
+
+  rte_memcpy(eth_hdr, header_template, sizeof(header_template));
+
+  struct MessageHeader *msg_hdr = (struct MessageHeader *)(udp_hdr + 1);
+  // ip_hdr->src_addr = htonl(0x01010101);
+  // ip_hdr->dst_addr = htonl(0x01010101);
+
+  udp_hdr->src_port = htons(1234);
+  udp_hdr->dst_port = htons(5678);
+
+  msg_hdr->seq_num = 1;
+  msg_hdr->rank = 2;
+
+  mbuf->data_len = sizeof(header_template) + sizeof(struct MessageHeader);
+  mbuf->pkt_len = mbuf->data_len;
+  mbuf->next = NULL;
+  mbuf->nb_segs = 1;
+  mbuf->ol_flags = 0;
+
 }
 
 void lcore_main() {
@@ -139,6 +317,7 @@ void lcore_main() {
   uint64_t now_tsc = rte_rdtsc();
   uint64_t tsc_hz = rte_get_tsc_hz();
   uint64_t next_update_tsc = now_tsc + tsc_hz;
+  uint32_t seconds_cnt = 0;
 
   uint64_t tsc_ms = tsc_hz / MS_PER_S;
   uint64_t next_ms_tsc = now_tsc + tsc_ms;
@@ -149,6 +328,8 @@ void lcore_main() {
   uint64_t finish_tsc = now_tsc + time_to_run * tsc_hz;
 
   uint64_t pkts_send_ms_cnt = 0;
+
+  struct rte_mbuf *mbuf;
 
   while (1) {
     now_tsc = rte_rdtsc();
@@ -161,9 +342,10 @@ void lcore_main() {
 
     if (unlikely(now_tsc > next_update_tsc)) {
       if (lcore_id == rte_get_main_lcore()) {
-        // TODO: print throughput here
+        print_per_core_throughput(seconds_cnt);
       }
       next_update_tsc += tsc_hz;
+      seconds_cnt++;
     }
 
     if (unlikely(now_tsc > next_ms_tsc)) {
@@ -172,16 +354,16 @@ void lcore_main() {
     }
 
     if (unlikely(now_tsc > next_drain_tsc)) {
-      // TODO: send packets
+      send_pcakets(lcore_id);
       next_drain_tsc += drain_tsc;
     }
 
     if ((now_tsc <= finish_tsc) &&
         (pkts_send_ms_cnt < pkts_send_limit_per_ms)) {
       pkts_send_ms_cnt++;
-      // TODO: allocate buffer
-      // TODO: generate packet
-      // TODO: enqueue packet
+      mbuf = rte_pktmbuf_alloc(pktmbuf_pool);
+      generate_packet(mbuf);
+      enqueue_packet(lcore_id, mbuf);
     }
   }
 }
