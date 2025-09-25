@@ -235,7 +235,7 @@ void send_pcakets(uint32_t lcore_id) {
 
   ret = rte_eth_tx_burst(conf->port, conf->tx_queue_id, m_table, len);
   // TODO: here should use bits
-  tput_stat[conf->vid].tx_bits += ret * 8;
+  tput_stat[conf->vid].tx_bits += ret * 8 * (sizeof(header_template) + sizeof(struct MessageHeader));
   if (unlikely(ret < len)) {
     tput_stat[conf->vid].dropped_pkts += len - ret;
     do {
