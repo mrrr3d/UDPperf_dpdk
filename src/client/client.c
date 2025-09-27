@@ -7,9 +7,11 @@
 #include <rte_common.h>
 #include <rte_cycles.h>
 #include <rte_eal.h>
+#include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
 #include <rte_ip4.h>
+#include <rte_launch.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mbuf_core.h>
@@ -26,7 +28,7 @@
 #define MBUF_CACHE_SIZE 250
 #define TX_RING_SIZE 1024
 #define RX_RING_SIZE 1024
-#define RX_QUEUES_PER_PORT 2
+#define RX_QUEUES_PER_PORT 1
 #define MAX_BURST_SIZE 32
 
 struct mbuf_table {
@@ -171,7 +173,7 @@ void app_init() {
   ret = rte_eth_dev_configure(port_id, RX_QUEUES_PER_PORT, tx_queues_per_port,
                               &port_conf);
   if (ret < 0) {
-    rte_exit(EXIT_FAILURE, "Cannot configure device: err=%d, port=%u\n", ret,
+    rte_exit(EXIT_FAILURE, "Cannot configure device: err=%s, port=%u\n", rte_strerror(ret),
              port_id);
   }
 
@@ -234,7 +236,6 @@ void send_pcakets(uint32_t lcore_id) {
   int ret;
 
   ret = rte_eth_tx_burst(conf->port, conf->tx_queue_id, m_table, len);
-  // TODO: here should use bits
   tput_stat[conf->vid].tx_bits += ret * 8 * (sizeof(header_template) + sizeof(struct MessageHeader));
   if (unlikely(ret < len)) {
     tput_stat[conf->vid].dropped_pkts += len - ret;
@@ -297,7 +298,7 @@ void generate_packet(struct rte_mbuf *mbuf) {
   // ip_hdr->dst_addr = htonl(0x01010101);
 
   udp_hdr->src_port = htons(1234);
-  udp_hdr->dst_port = htons(5678);
+  udp_hdr->dst_port = htons(8100);
 
   msg_hdr->seq_num = 1;
   msg_hdr->rank = 2;
@@ -310,7 +311,7 @@ void generate_packet(struct rte_mbuf *mbuf) {
 
 }
 
-void lcore_main() {
+int lcore_main(__rte_unused void *arg) {
   uint32_t lcore_id = rte_lcore_id();
   fprintf(stdout, "lcore %u started\n", lcore_id);
 
@@ -366,6 +367,8 @@ void lcore_main() {
       enqueue_packet(lcore_id, mbuf);
     }
   }
+
+  return 0;
 }
 
 int app_parse_args(int argc, char **argv) {
@@ -407,6 +410,8 @@ int main(int argc, char **argv) {
   }
 
   app_init();
+
+  rte_eal_mp_remote_launch(lcore_main, NULL, CALL_MAIN);
 
   rte_eal_cleanup();
 
