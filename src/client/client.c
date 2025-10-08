@@ -1,21 +1,18 @@
+#include "client.h"
+
 #include <arpa/inet.h>
 #include <assert.h>
 #include <generic/rte_cycles.h>
 #include <rte_branch_prediction.h>
 #include <rte_build_config.h>
 #include <rte_byteorder.h>
-#include <rte_common.h>
 #include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
-#include <rte_ether.h>
-#include <rte_ip4.h>
 #include <rte_launch.h>
-#include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mbuf_core.h>
-#include <rte_udp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,44 +21,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#define NUM_MBUFS 8191
-#define MBUF_CACHE_SIZE 250
-#define TX_RING_SIZE 1024
-#define RX_RING_SIZE 1024
-#define RX_QUEUES_PER_PORT 1
-#define MAX_BURST_SIZE 32
-
-struct mbuf_table {
-  uint32_t len;
-  struct rte_mbuf *m_table[MAX_BURST_SIZE];
-};
-
-struct lcore_configuration {
-  uint32_t vid;
-  uint32_t port;
-  uint32_t tx_queue_id;
-  struct mbuf_table tx_mbufs;
-} __rte_cache_aligned;
-
-struct throughput_statistics {
-  uint64_t tx_bits;
-  uint64_t last_tx_bits;
-  uint64_t dropped_pkts;
-  uint64_t last_dropped_pkts;
-} __rte_cache_aligned;
-
-struct MessageHeader {
-  uint32_t seq_num;
-  uint32_t rank;
-
-  uint8_t fill_pkt[1450];
-} __rte_packed;
-
 struct lcore_configuration lcore_conf[RTE_MAX_LCORE];
 struct throughput_statistics tput_stat[RTE_MAX_LCORE];
 uint8_t header_template[sizeof(struct rte_ether_hdr) +
                         sizeof(struct rte_ipv4_hdr) +
                         sizeof(struct rte_udp_hdr)];
+
+// args
 uint64_t pkts_send_limit_per_ms = 800;
 uint64_t time_to_run = 10;
 
@@ -173,8 +139,8 @@ void app_init() {
   ret = rte_eth_dev_configure(port_id, RX_QUEUES_PER_PORT, tx_queues_per_port,
                               &port_conf);
   if (ret < 0) {
-    rte_exit(EXIT_FAILURE, "Cannot configure device: err=%s, port=%u\n", rte_strerror(ret),
-             port_id);
+    rte_exit(EXIT_FAILURE, "Cannot configure device: err=%s, port=%u\n",
+             rte_strerror(ret), port_id);
   }
 
   ret = rte_eth_dev_adjust_nb_rx_tx_desc(port_id, &nb_rxd, &nb_txd);
@@ -236,7 +202,8 @@ void send_pcakets(uint32_t lcore_id) {
   int ret;
 
   ret = rte_eth_tx_burst(conf->port, conf->tx_queue_id, m_table, len);
-  tput_stat[conf->vid].tx_bits += ret * 8 * (sizeof(header_template) + sizeof(struct MessageHeader));
+  tput_stat[conf->vid].tx_bits +=
+      ret * 8 * (sizeof(header_template) + sizeof(struct MessageHeader));
   if (unlikely(ret < len)) {
     tput_stat[conf->vid].dropped_pkts += len - ret;
     do {
@@ -308,7 +275,6 @@ void generate_packet(struct rte_mbuf *mbuf) {
   mbuf->next = NULL;
   mbuf->nb_segs = 1;
   mbuf->ol_flags = 0;
-
 }
 
 int lcore_main(__rte_unused void *arg) {
