@@ -6,11 +6,13 @@
 #include <rte_branch_prediction.h>
 #include <rte_build_config.h>
 #include <rte_byteorder.h>
+#include <rte_common.h>
 #include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_launch.h>
+#include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mbuf_core.h>
 #include <stdint.h>
@@ -23,19 +25,24 @@
 
 struct lcore_configuration lcore_conf[RTE_MAX_LCORE];
 struct throughput_statistics tput_stat[RTE_MAX_LCORE];
+
+uint8_t enabled_ports[RTE_MAX_ETHPORTS];
+uint32_t n_enabled_ports;
+
 uint8_t header_template[sizeof(struct rte_ether_hdr) +
                         sizeof(struct rte_ipv4_hdr) +
                         sizeof(struct rte_udp_hdr)];
-
-// args
-uint64_t pkts_send_limit_per_ms = 800;
-uint64_t time_to_run = 10;
 
 uint32_t n_lcores;
 
 struct rte_mempool *pktmbuf_pool;
 
-void init_header_template() {
+// args
+uint64_t pkts_send_limit_per_ms = 800;
+uint64_t time_to_run = 10;
+uint16_t num_ports = 1;
+
+void init_header_template(void) {
   memset(header_template, 0, sizeof(header_template));
 
   struct rte_ether_hdr *eth_hdr = (struct rte_ether_hdr *)header_template;
@@ -76,7 +83,7 @@ void init_header_template() {
   udp_hdr->dgram_cksum = 0;
 }
 
-void app_init() {
+void app_init(void) {
   fprintf(stdout, "App init\n");
 
   int ret;
@@ -94,101 +101,145 @@ void app_init() {
   n_lcores = rte_lcore_count();
   fprintf(stdout, "Number of lcores: %d\n", n_lcores);
 
-  // TODO: currently only use 1 port
-  uint32_t tx_queues_per_port = n_lcores;
+  uint16_t n_avail_ports = rte_eth_dev_count_avail();
+  fprintf(stdout, "Number of ports available: %d\n", n_avail_ports);
+  if (n_avail_ports < num_ports) {
+    fprintf(stderr, "Available ports: %d, required ports: %d\n", n_avail_ports,
+            num_ports);
+    rte_exit(EXIT_FAILURE, "not enough available ports\n");
+  }
 
-  // Initialize port
-  uint32_t port_id = 0;
+  if ((n_lcores - 1) % num_ports) {
+    rte_exit(EXIT_FAILURE,
+             "(n_lcores - 1) should be a multiple of number of ports, n_lcores"
+             "=%u, num_ports=%u\n",
+             n_lcores, num_ports);
+  }
+
+  memset(enabled_ports, 0, sizeof(enabled_ports));
+  n_enabled_ports = 0;
+  for (uint16_t i = 0; i < RTE_MAX_ETHPORTS; i++) {
+    if (rte_eth_dev_is_valid_port(i)) {
+      enabled_ports[i] = 1;
+      n_enabled_ports++;
+    }
+    if (n_enabled_ports >= num_ports) {
+      break;
+    }
+  }
+
+  uint32_t tx_queues_per_port = (n_lcores - 1) / num_ports;
 
   uint32_t vid = 0;
   uint32_t tx_queue_id = 0;
-  for (int i = 0; i < RTE_MAX_LCORE; i++) {
+  uint16_t porti = 0;
+  uint32_t main_lcore_id = rte_get_main_lcore();
+
+  while (porti < RTE_MAX_ETHPORTS && enabled_ports[porti] == 0) porti++;
+  for (uint32_t i = 0; i < RTE_MAX_LCORE; i++) {
     if (rte_lcore_is_enabled(i)) {
       lcore_conf[i].vid = vid++;
-      lcore_conf[i].port = port_id;
-      lcore_conf[i].tx_queue_id = tx_queue_id++;
       lcore_conf[i].tx_mbufs.len = 0;
+
+      // skip the main lcore
+      if (i != main_lcore_id) {
+        lcore_conf[i].tx_queue_id = tx_queue_id++;
+        lcore_conf[i].port = porti;
+
+        if (tx_queue_id >= tx_queues_per_port) {
+          tx_queue_id = 0;
+          porti++;
+          while (porti < RTE_MAX_ETHPORTS && enabled_ports[porti] == 0) porti++;
+        }
+      }
     }
   }
 
-  if (!rte_eth_dev_is_valid_port(port_id)) {
-    fprintf(stderr, "Invalid port %d\n", port_id);
-    rte_exit(EXIT_FAILURE, "Invalid port %d\n", port_id);
-  }
+  // Initialize ports
+  for (porti = 0; porti < RTE_MAX_ETHPORTS; porti++) {
+    if (enabled_ports[porti] == 0) {
+      continue;
+    }
 
-  struct rte_eth_conf port_conf;
-  struct rte_eth_dev_info dev_info;
-  struct rte_eth_txconf txconf;
-  uint16_t nb_rxd = RX_RING_SIZE;
-  uint16_t nb_txd = TX_RING_SIZE;
+    if (!rte_eth_dev_is_valid_port(porti)) {
+      fprintf(stderr, "Invalid port %d\n", porti);
+      rte_exit(EXIT_FAILURE, "Invalid port %d\n", porti);
+    }
 
-  memset(&port_conf, 0, sizeof(struct rte_eth_dev_info));
+    struct rte_eth_conf port_conf;
+    struct rte_eth_dev_info dev_info;
+    struct rte_eth_txconf txconf;
+    uint16_t nb_rxd = RX_RING_SIZE;
+    uint16_t nb_txd = TX_RING_SIZE;
 
-  ret = rte_eth_dev_info_get(port_id, &dev_info);
-  if (ret != 0) {
-    fprintf(stderr, "Error during getting device (port %u) info: %s\n", port_id,
-            strerror(-ret));
-    rte_exit(EXIT_FAILURE, "Cannot get device (port %u) info: %s\n", port_id,
-             strerror(-ret));
-  }
+    memset(&port_conf, 0, sizeof(struct rte_eth_dev_info));
 
-  if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) {
-    port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
-  }
+    ret = rte_eth_dev_info_get(porti, &dev_info);
+    if (ret != 0) {
+      fprintf(stderr, "Error during getting device (port %u) info: %s\n", porti,
+              strerror(-ret));
+      rte_exit(EXIT_FAILURE, "Cannot get device (port %u) info: %s\n", porti,
+               strerror(-ret));
+    }
 
-  ret = rte_eth_dev_configure(port_id, RX_QUEUES_PER_PORT, tx_queues_per_port,
-                              &port_conf);
-  if (ret < 0) {
-    rte_exit(EXIT_FAILURE, "Cannot configure device: err=%s, port=%u\n",
-             rte_strerror(ret), port_id);
-  }
+    if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) {
+      port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+    }
 
-  ret = rte_eth_dev_adjust_nb_rx_tx_desc(port_id, &nb_rxd, &nb_txd);
-  if (ret != 0) {
-    rte_exit(EXIT_FAILURE,
-             "Cannot adjust number of descriptors: err=%d, port=%u\n", ret,
-             port_id);
-  }
-
-  for (int i = 0; i < RX_QUEUES_PER_PORT; i++) {
-    ret = rte_eth_rx_queue_setup(
-        port_id, i, nb_rxd, rte_eth_dev_socket_id(port_id), NULL, pktmbuf_pool);
+    ret = rte_eth_dev_configure(porti, RX_QUEUES_PER_PORT, tx_queues_per_port,
+                                &port_conf);
     if (ret < 0) {
-      rte_exit(EXIT_FAILURE, "Cannot setup RX queue %d\n", i);
+      rte_exit(EXIT_FAILURE, "Cannot configure device: err=%s, port=%u\n",
+               rte_strerror(ret), porti);
     }
-  }
 
-  txconf = dev_info.default_txconf;
-  txconf.offloads = port_conf.txmode.offloads;
-  for (int i = 0; i < tx_queues_per_port; i++) {
-    ret = rte_eth_tx_queue_setup(port_id, i, nb_txd,
-                                 rte_eth_dev_socket_id(port_id), &txconf);
+    ret = rte_eth_dev_adjust_nb_rx_tx_desc(porti, &nb_rxd, &nb_txd);
+    if (ret != 0) {
+      rte_exit(EXIT_FAILURE,
+               "Cannot adjust number of descriptors: err=%d, port=%u\n", ret,
+               porti);
+    }
+
+    for (int i = 0; i < RX_QUEUES_PER_PORT; i++) {
+      ret = rte_eth_rx_queue_setup(
+          porti, i, nb_rxd, rte_eth_dev_socket_id(porti), NULL, pktmbuf_pool);
+      if (ret < 0) {
+        rte_exit(EXIT_FAILURE, "Cannot setup RX queue %d\n", i);
+      }
+    }
+
+    txconf = dev_info.default_txconf;
+    txconf.offloads = port_conf.txmode.offloads;
+    for (uint32_t i = 0; i < tx_queues_per_port; i++) {
+      ret = rte_eth_tx_queue_setup(porti, i, nb_txd,
+                                   rte_eth_dev_socket_id(porti), &txconf);
+      if (ret < 0) {
+        rte_exit(EXIT_FAILURE, "Cannot setup TX queue %d\n", i);
+      }
+    }
+
+    ret = rte_eth_dev_start(porti);
     if (ret < 0) {
-      rte_exit(EXIT_FAILURE, "Cannot setup TX queue %d\n", i);
+      rte_exit(EXIT_FAILURE, "Cannot start port %d\n", porti);
     }
-  }
 
-  ret = rte_eth_dev_start(port_id);
-  if (ret < 0) {
-    rte_exit(EXIT_FAILURE, "Cannot start port %d\n", port_id);
-  }
+    struct rte_ether_addr eth_addr;
+    ret = rte_eth_macaddr_get(porti, &eth_addr);
+    if (ret < 0) {
+      rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret,
+               porti);
+    }
 
-  struct rte_ether_addr eth_addr;
-  ret = rte_eth_macaddr_get(port_id, &eth_addr);
-  if (ret < 0) {
-    rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret,
-             port_id);
-  }
+    fprintf(stdout,
+            "Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8
+            " %02" PRIx8 " %02" PRIx8 "\n",
+            porti, RTE_ETHER_ADDR_BYTES(&eth_addr));
 
-  fprintf(stdout,
-          "Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8
-          " %02" PRIx8 " %02" PRIx8 "\n",
-          port_id, RTE_ETHER_ADDR_BYTES(&eth_addr));
-
-  ret = rte_eth_promiscuous_enable(port_id);
-  if (ret < 0) {
-    rte_exit(EXIT_FAILURE, "Cannot enable promiscuous mode: err=%d, port=%u\n",
-             ret, port_id);
+    ret = rte_eth_promiscuous_enable(porti);
+    if (ret < 0) {
+      rte_exit(EXIT_FAILURE,
+               "Cannot enable promiscuous mode: err=%d, port=%u\n", ret, porti);
+    }
   }
   init_header_template();
 }
@@ -199,7 +250,7 @@ void send_pcakets(uint32_t lcore_id) {
   uint32_t len = conf->tx_mbufs.len;
   struct rte_mbuf **m_table = (struct rte_mbuf **)conf->tx_mbufs.m_table;
 
-  int ret;
+  uint16_t ret;
 
   ret = rte_eth_tx_burst(conf->port, conf->tx_queue_id, m_table, len);
   tput_stat[conf->vid].tx_bits +=
@@ -219,7 +270,7 @@ void print_per_core_throughput(uint32_t seconds) {
   uint64_t total_tx_bits = 0;
   uint64_t total_dropped_pkts = 0;
 
-  for (int i = 0; i < n_lcores; i++) {
+  for (uint32_t i = 0; i < n_lcores; i++) {
     struct throughput_statistics *stat = &tput_stat[i];
     uint64_t tx_bits = stat->tx_bits - stat->last_tx_bits;
     uint64_t dropped_pkts = stat->dropped_pkts - stat->last_dropped_pkts;
@@ -277,14 +328,9 @@ void generate_packet(struct rte_mbuf *mbuf) {
   mbuf->ol_flags = 0;
 }
 
-int lcore_main(__rte_unused void *arg) {
-  uint32_t lcore_id = rte_lcore_id();
-  fprintf(stdout, "lcore %u started\n", lcore_id);
-
+int lcore_loop_worker(uint32_t lcore_id) {
   uint64_t now_tsc = rte_rdtsc();
   uint64_t tsc_hz = rte_get_tsc_hz();
-  uint64_t next_update_tsc = now_tsc + tsc_hz;
-  uint32_t seconds_cnt = 0;
 
   uint64_t tsc_ms = tsc_hz / MS_PER_S;
   uint64_t next_ms_tsc = now_tsc + tsc_ms;
@@ -303,16 +349,8 @@ int lcore_main(__rte_unused void *arg) {
 
     // finished
     if (unlikely(now_tsc > finish_tsc)) {
-      fprintf(stdout, "Finished\n");
+      fprintf(stdout, "lcore %u finished\n", lcore_id);
       break;
-    }
-
-    if (unlikely(now_tsc > next_update_tsc)) {
-      if (lcore_id == rte_get_main_lcore()) {
-        print_per_core_throughput(seconds_cnt);
-      }
-      next_update_tsc += tsc_hz;
-      seconds_cnt++;
     }
 
     if (unlikely(now_tsc > next_ms_tsc)) {
@@ -337,11 +375,48 @@ int lcore_main(__rte_unused void *arg) {
   return 0;
 }
 
+int lcore_loop_main(uint32_t lcore_id) {
+  uint64_t now_tsc = rte_rdtsc();
+  uint64_t tsc_hz = rte_get_tsc_hz();
+  uint64_t next_update_tsc = now_tsc + tsc_hz;
+  uint32_t seconds_cnt = 0;
+  uint64_t finish_tsc = now_tsc + time_to_run * tsc_hz;
+
+  while (1) {
+    now_tsc = rte_rdtsc();
+
+    // finished
+    if (unlikely(now_tsc > finish_tsc)) {
+      fprintf(stdout, "lcore %u finished\n", lcore_id);
+      break;
+    }
+
+    if (unlikely(now_tsc > next_update_tsc)) {
+      print_per_core_throughput(seconds_cnt);
+      next_update_tsc += tsc_hz;
+      seconds_cnt++;
+    }
+  }
+
+  return 0;
+}
+
+int lcore_loop(__rte_unused void *arg) {
+  uint32_t lcore_id = rte_lcore_id();
+  fprintf(stdout, "lcore %u started\n", lcore_id);
+
+  if (lcore_id == rte_get_main_lcore()) {
+    return lcore_loop_main(lcore_id);
+  } else {
+    return lcore_loop_worker(lcore_id);
+  }
+}
+
 int app_parse_args(int argc, char **argv) {
   int opt;
   long long num;
 
-  while (-1 != (opt = getopt(argc, argv, "s:T:"))) {
+  while (-1 != (opt = getopt(argc, argv, "s:T:P:"))) {
     switch (opt) {
       case 's':
         num = atoi(optarg);
@@ -350,6 +425,10 @@ int app_parse_args(int argc, char **argv) {
       case 'T':
         num = atoi(optarg);
         time_to_run = num;
+        break;
+      case 'P':
+        num = atoi(optarg);
+        num_ports = num;
         break;
       default:
         fprintf(stderr, "unknown option %c\n", opt);
@@ -377,7 +456,7 @@ int main(int argc, char **argv) {
 
   app_init();
 
-  rte_eal_mp_remote_launch(lcore_main, NULL, CALL_MAIN);
+  rte_eal_mp_remote_launch(lcore_loop, NULL, CALL_MAIN);
 
   rte_eal_cleanup();
 
