@@ -312,9 +312,11 @@ void generate_packet(struct rte_mbuf *mbuf) {
   rte_memcpy(eth_hdr, header_template, sizeof(header_template));
 
   struct MessageHeader *msg_hdr = (struct MessageHeader *)(udp_hdr + 1);
+  // TODO: designate ip
   // ip_hdr->src_addr = htonl(0x01010101);
   // ip_hdr->dst_addr = htonl(0x01010101);
 
+  // TODO: designate port
   udp_hdr->src_port = htons(1234);
   udp_hdr->dst_port = htons(8100);
 
