@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <generic/rte_cycles.h>
+#include <generic/rte_prefetch.h>
 #include <rte_branch_prediction.h>
 #include <rte_build_config.h>
 #include <rte_byteorder.h>
@@ -11,6 +12,7 @@
 #include <rte_eal.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
+#include <rte_ether.h>
 #include <rte_launch.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
@@ -80,6 +82,7 @@ void init_header_template(void) {
                                         sizeof(struct rte_ipv4_hdr));
   udp_hdr->dgram_cksum = 0;
 }
+
 void app_init(void) {
   fprintf(stdout, "App init\n");
 
@@ -241,6 +244,111 @@ void app_init(void) {
   init_header_template();
 }
 
+void process_client_packet(uint32_t lcore_id, struct rte_mbuf *mbuf) {
+  // TODO: should be per-dstport
+  tput_stat[lcore_id].rx_bits += 8 * mbuf->pkt_len;
+}
+
+void print_per_core_throughput(uint32_t seconds) {
+  fprintf(stdout, "%6" PRIu32 " seconds\n", seconds);
+
+  uint64_t total_rx_bits = 0;
+  uint64_t total_dropped_pkts = 0;
+
+  for (uint32_t i = 0; i < n_lcores; i++) {
+    struct throughput_statistics *stat = &tput_stat[i];
+    uint64_t rx_bits = stat->rx_bits - stat->last_rx_bits;
+    uint64_t dropped_pkts = stat->dropped_pkts - stat->last_dropped_pkts;
+    fprintf(stdout,
+            "\tcore %" PRIu32 "\trx_bits: %" PRIu64 "\tdropped_pkts: %" PRIu64
+            "\n",
+            i, rx_bits, dropped_pkts);
+
+    stat->last_rx_bits = stat->rx_bits;
+    stat->last_dropped_pkts = stat->dropped_pkts;
+
+    total_rx_bits += rx_bits;
+    total_dropped_pkts += dropped_pkts;
+  }
+
+  fprintf(stdout, "\ttotal\trx_bits: %" PRIu64 "\tdropped_pkts: %" PRIu64 "\n",
+          total_rx_bits, total_dropped_pkts);
+
+  fflush(stdout);
+}
+
+int lcore_loop_worker(uint32_t lcore_id) {
+  uint64_t now_tsc = rte_rdtsc();
+  uint64_t tsc_hz = rte_get_tsc_hz();
+
+  uint64_t finish_tsc = now_tsc + time_to_run * tsc_hz;
+
+  struct rte_mbuf *mbuf;
+  struct rte_mbuf *mbuf_rx_burst[MAX_BURST_SIZE];
+
+  struct lcore_configuration *lconf = &lcore_conf[lcore_id];
+  uint16_t n_rx = 0;
+  uint16_t i = 0;
+
+  while (1) {
+    now_tsc = rte_rdtsc();
+
+    // finished
+    if (unlikely(now_tsc > finish_tsc)) {
+      fprintf(stdout, "lcore %u finished\n", lcore_id);
+      break;
+    }
+
+    n_rx = rte_eth_rx_burst(lconf->port, lconf->rx_queue_id, mbuf_rx_burst,
+                            MAX_BURST_SIZE);
+    for (i = 0; i < n_rx; i++) {
+      mbuf = mbuf_rx_burst[i];
+      rte_prefetch0(rte_pktmbuf_mtod(mbuf, void *));
+
+      rte_pktmbuf_free(mbuf);
+    }
+  }
+
+  return 0;
+}
+
+int lcore_loop_main(uint32_t lcore_id) {
+  uint64_t now_tsc = rte_rdtsc();
+  uint64_t tsc_hz = rte_get_tsc_hz();
+  uint64_t next_update_tsc = now_tsc + tsc_hz;
+  uint32_t seconds_cnt = 0;
+  uint64_t finish_tsc = now_tsc + time_to_run * tsc_hz;
+
+  while (1) {
+    now_tsc = rte_rdtsc();
+
+    // finished
+    if (unlikely(now_tsc > finish_tsc)) {
+      fprintf(stdout, "lcore %u finished\n", lcore_id);
+      break;
+    }
+
+    if (unlikely(now_tsc > next_update_tsc)) {
+      print_per_core_throughput(seconds_cnt);
+      next_update_tsc += tsc_hz;
+      seconds_cnt++;
+    }
+  }
+
+  return 0;
+}
+
+int lcore_loop(__rte_unused void *arg) {
+  uint32_t lcore_id = rte_lcore_id();
+  fprintf(stdout, "lcore %u started\n", lcore_id);
+
+  if (lcore_id == rte_get_main_lcore()) {
+    return lcore_loop_main(lcore_id);
+  } else {
+    return lcore_loop_worker(lcore_id);
+  }
+}
+
 int app_parse_args(int argc, char **argv) {
   int opt;
   long long num;
@@ -281,7 +389,7 @@ int main(int argc, char **argv) {
 
   app_init();
 
-  // rte_eal_mp_remote_launch(lcore_loop, NULL, CALL_MAIN);
+  rte_eal_mp_remote_launch(lcore_loop, NULL, CALL_MAIN);
 
   rte_eal_cleanup();
 
