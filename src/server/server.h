@@ -24,7 +24,7 @@ struct mbuf_table {
 struct lcore_configuration {
   uint32_t vid;
   uint16_t port;
-  uint32_t tx_queue_id;
+  uint32_t rx_queue_id;
   struct mbuf_table tx_mbufs;
 } __rte_cache_aligned;
 

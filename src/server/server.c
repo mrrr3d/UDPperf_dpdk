@@ -140,7 +140,7 @@ void app_init(void) {
 
       // skip the main lcore
       if (i != main_lcore_id) {
-        lcore_conf[i].tx_queue_id = rx_queue_id++;
+        lcore_conf[i].rx_queue_id = rx_queue_id++;
         lcore_conf[i].port = porti;
 
         if (rx_queue_id >= rx_queues_per_port) {
