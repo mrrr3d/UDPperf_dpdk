@@ -136,7 +136,7 @@ void app_init(void) {
   for (uint32_t i = 0; i < RTE_MAX_LCORE; i++) {
     if (rte_lcore_is_enabled(i)) {
       lcore_conf[i].vid = vid++;
-      lcore_conf[i].tx_mbufs.len = 0;
+      lcore_conf[i].rx_mbufs.len = 0;
 
       // skip the main lcore
       if (i != main_lcore_id) {

@@ -25,12 +25,12 @@ struct lcore_configuration {
   uint32_t vid;
   uint16_t port;
   uint32_t rx_queue_id;
-  struct mbuf_table tx_mbufs;
+  struct mbuf_table rx_mbufs;
 } __rte_cache_aligned;
 
 struct throughput_statistics {
-  uint64_t tx_bits;
-  uint64_t last_tx_bits;
+  uint64_t rx_bits;
+  uint64_t last_rx_bits;
   uint64_t dropped_pkts;
   uint64_t last_dropped_pkts;
 } __rte_cache_aligned;
@@ -41,13 +41,10 @@ struct MessageHeader {
   uint8_t fill_pkt[1450];
 } __rte_packed;
 
-// void init_header_template(void);
-// void app_init(void);
-// void send_pcakets(uint32_t lcore_id);
+void init_header_template(void);
+void app_init(void);
 // void print_per_core_throughput(uint32_t seconds);
-// void enqueue_packet(uint32_t lcore_id, struct rte_mbuf *pkt);
-// void generate_packet(struct rte_mbuf *mbuf);
-// int lcore_main(void *arg);
-// int app_parse_args(int argc, char **argv);
+int lcore_main(void *arg);
+int app_parse_args(int argc, char **argv);
 
 #endif  // SERVER_H
