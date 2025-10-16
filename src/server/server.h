@@ -15,6 +15,8 @@
 #define RX_RING_SIZE 1024
 #define TX_QUEUES_PER_PORT 1
 #define MAX_BURST_SIZE 32
+#define FLOW_NUM 3
+#define BASE_DST_PORT 8000
 
 struct mbuf_table {
   uint32_t len;

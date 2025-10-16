@@ -13,10 +13,12 @@
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
+#include <rte_ip4.h>
 #include <rte_launch.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mbuf_core.h>
+#include <rte_udp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,7 +28,12 @@
 #include <unistd.h>
 
 struct lcore_configuration lcore_conf[RTE_MAX_LCORE];
-struct throughput_statistics tput_stat[RTE_MAX_LCORE];
+
+// throughput per lcore
+struct throughput_statistics lcore_tput_stat[RTE_MAX_LCORE];
+
+// throughput per flow
+struct throughput_statistics flow_tput_stat[FLOW_NUM];
 
 uint8_t enabled_ports[RTE_MAX_ETHPORTS];
 uint32_t n_enabled_ports;
@@ -244,9 +251,33 @@ void app_init(void) {
   init_header_template();
 }
 
+// map udp port to flow_tput_stat idx
+int udp_port_to_idx(uint16_t port) {
+  // dst port ranges from BASE_DST_PORT to BASE_DST_PORT + FLOW_NUM - 1
+  return port - BASE_DST_PORT;
+}
+
 void process_client_packet(uint32_t lcore_id, struct rte_mbuf *mbuf) {
-  // TODO: should be per-dstport
-  tput_stat[lcore_id].rx_bits += 8 * mbuf->pkt_len;
+  // per lcore statistics
+  lcore_tput_stat[lcore_id].rx_bits += 8 * mbuf->pkt_len;
+
+  struct rte_ether_hdr *eth_hdr =
+      rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+
+  // if not ipv4, ignore
+  if (rte_be_to_cpu_16(eth_hdr->ether_type) != RTE_ETHER_TYPE_IPV4) {
+    return;
+  }
+
+  struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+  struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)(ip_hdr + 1);
+
+  // Some data in the message header should be parsed here
+  // struct MessageHeader *msg_hdr = (struct MessageHeader *)(udp_hdr + 1);
+
+  uint16_t dst_port = rte_be_to_cpu_16(udp_hdr->dst_port);
+
+  flow_tput_stat[udp_port_to_idx(dst_port)].rx_bits += 8 * mbuf->pkt_len;
 }
 
 void print_per_core_throughput(uint32_t seconds) {
@@ -256,7 +287,7 @@ void print_per_core_throughput(uint32_t seconds) {
   uint64_t total_dropped_pkts = 0;
 
   for (uint32_t i = 0; i < n_lcores; i++) {
-    struct throughput_statistics *stat = &tput_stat[i];
+    struct throughput_statistics *stat = &lcore_tput_stat[i];
     uint64_t rx_bits = stat->rx_bits - stat->last_rx_bits;
     uint64_t dropped_pkts = stat->dropped_pkts - stat->last_dropped_pkts;
     fprintf(stdout,
@@ -269,6 +300,19 @@ void print_per_core_throughput(uint32_t seconds) {
 
     total_rx_bits += rx_bits;
     total_dropped_pkts += dropped_pkts;
+  }
+
+  for (uint32_t i = 0; i < FLOW_NUM; i++) {
+    struct throughput_statistics *stat = &flow_tput_stat[i];
+    uint64_t rx_bits = stat->rx_bits - stat->last_rx_bits;
+    uint64_t dropped_pkts = stat->dropped_pkts - stat->last_dropped_pkts;
+    fprintf(stdout,
+            "\tport %" PRIu32 "\trx_bits: %" PRIu64 "\tdropped_pkts: %" PRIu64
+            "\n",
+            BASE_DST_PORT + i, rx_bits, dropped_pkts);
+
+    stat->last_rx_bits = stat->rx_bits;
+    stat->last_dropped_pkts = stat->dropped_pkts;
   }
 
   fprintf(stdout, "\ttotal\trx_bits: %" PRIu64 "\tdropped_pkts: %" PRIu64 "\n",
