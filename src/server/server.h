@@ -43,7 +43,7 @@ struct MessageHeader {
 
 void init_header_template(void);
 void app_init(void);
-// void print_per_core_throughput(uint32_t seconds);
+void print_per_core_throughput(uint32_t seconds);
 int lcore_main(void *arg);
 int app_parse_args(int argc, char **argv);
 
