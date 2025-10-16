@@ -304,7 +304,7 @@ int lcore_loop_worker(uint32_t lcore_id) {
     for (i = 0; i < n_rx; i++) {
       mbuf = mbuf_rx_burst[i];
       rte_prefetch0(rte_pktmbuf_mtod(mbuf, void *));
-
+      process_client_packet(lcore_id, mbuf);
       rte_pktmbuf_free(mbuf);
     }
   }
