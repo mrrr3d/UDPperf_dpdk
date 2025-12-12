@@ -1,5 +1,10 @@
 # udpperf_dpdk
 
+## Environment
+
+- DPDK version: dpdk-24.11.3
+- OS version: Ubuntu 24.04
+
 ## Build
 ```bash
 meson setup build
